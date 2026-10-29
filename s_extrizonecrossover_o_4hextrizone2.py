@@ -24,7 +24,7 @@ def send_telegram_alert(title, message_body, alert_type="TRADE"):
         f"-----------------------------------\n"
         f"{message_body}\n"
         f"-----------------------------------\n"
-        f"🤖 *Bot Status:* 4H Stoch Cross (>85/<15) + LTF Cross (>94/<6) + OB"
+        f"🤖 *Bot Status:* 4H Stoch Cross (>90/<10) + LTF Cross (>94/<6) + OB"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -105,8 +105,8 @@ def calculate_stoch_rsi(df, period=14, smooth_k=3, smooth_d=3):
 def check_4h_macro_crossover(symbol, is_long):
     """
     Checks 4-hour timeframe Stochastic RSI fresh crossover condition (4h A):
-    - For Longs: Fresh crossover upwards (%K crosses above %D) within below 15 zone.
-    - For Shorts: Fresh crossover downwards (%K crosses below %D) within above 85 zone.
+    - For Longs: Fresh crossover upwards (%K crosses above %D) within below 10 zone.
+    - For Shorts: Fresh crossover downwards (%K crosses below %D) within above 90 zone.
     """
     try:
         ohlcv_4h = fetch_ohlcv_direct(symbol, '4h', limit=50)
@@ -128,14 +128,14 @@ def check_4h_macro_crossover(symbol, is_long):
             return False
             
         if is_long:
-            # 4H Long: Fresh cross upwards within below 15 zone
+            # 4H Long: Fresh cross upwards within below 10 zone
             is_cross_up = (prev_k <= prev_d and k > d) or (prev2_k <= prev2_d and prev_k > prev_d)
-            in_zone = (k < 15 or prev_k < 15 or prev2_k < 15) and (d < 15)
+            in_zone = (k < 10 or prev_k < 10 or prev2_k < 10) and (d < 10)
             return is_cross_up and in_zone
         else:
-            # 4H Short: Fresh cross downwards within above 85 zone
+            # 4H Short: Fresh cross downwards within above 90 zone
             is_cross_down = (prev_k >= prev_d and k < d) or (prev2_k >= prev2_d and prev_k < prev_d)
-            in_zone = (k > 85 or prev_k > 85 or prev2_k > 85) and (d > 85)
+            in_zone = (k > 90 or prev_k > 90 or prev2_k > 90) and (d > 90)
             return is_cross_down and in_zone
     except Exception:
         return False
@@ -186,7 +186,7 @@ def check_precision_order_block(df, is_long):
 
 def scan_markets():
     print("="*70)
-    print(" WOWBOT: 4H Stoch Cross (>85/<15) + LTF Cross (>94/<6) + OB Scanner ")
+    print(" WOWBOT: 4H Stoch Cross (>90/<10) + LTF Cross (>94/<6) + OB Scanner ")
     print("="*70)
     
     pairs = fetch_top_usdt_pairs()
@@ -257,7 +257,7 @@ def scan_markets():
                         tp1 = price + (risk * 2.0)   # 1:2 RRR
                         tp2 = price + (risk * 3.5)   # 1:3.5 RRR
                         direction = f"🟢 LONG"
-                        macro_desc = "4H Cross Up within < 15 Zone"
+                        macro_desc = "4H Cross Up within < 10 Zone"
                         ltf_desc = "LTF Cross Up within < 6 Zone + Bullish OB"
                     else:
                         stop_loss = ob_high * 1.005 # 0.5% buffer above OB end high
@@ -265,7 +265,7 @@ def scan_markets():
                         tp1 = price - (risk * 2.0)   # 1:2 RRR
                         tp2 = price - (risk * 3.5)   # 1:3.5 RRR
                         direction = f"🔴 SHORT"
-                        macro_desc = "4H Cross Down within > 85 Zone"
+                        macro_desc = "4H Cross Down within > 90 Zone"
                         ltf_desc = "LTF Cross Down within > 94 Zone + Bearish OB"
 
                     alert_key = f"{symbol}_{tf}"
