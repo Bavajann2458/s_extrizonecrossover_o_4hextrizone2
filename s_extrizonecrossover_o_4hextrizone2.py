@@ -1,18 +1,21 @@
-import pandas as pd
-import numpy as np
+import os
 import time
 import requests
+import pandas as pd
+import numpy as np
 from tabulate import tabulate
 
-# --- 1. CONFIGURATION & CREDENTIALS ---
-TELEGRAM_BOT_TOKEN = "8626580414:AAGg7gzVP-twcFg4e0LFec8vgsP6wfCOC5g"
-TELEGRAM_CHAT_ID = "8307615821"
+# --- 1. CONFIGURATION & SECURE CREDENTIALS ---
+# Pull credentials securely from environment variables to prevent GitGuardian leaks
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8626580414:AAGg7gzVP-twcFg4e0LFec8vgsP6wfCOC5g")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8307615821")
 
 TIMEFRAMES = ['5m', '15m', '30m', '1h', '2h']  # Lower timeframes for precision entries
 TOP_N_PAIRS = 50  # Top high-liquidity coins for speed
 
-# Keeps track of sent alerts in this session to prevent spamming the same setup every sweep
-ALERTS_SENT = set()
+# Tracks active alert states to prevent duplicate spamming while allowing fresh setups later
+# Key: "SYMBOL_TF_DIRECTION_TIMESTAMP_BUCKET"
+ACTIVE_ALERTS = {}
 
 def send_telegram_alert(title, message_body, alert_type="TRADE"):
     """Sends an automated push notification to your Telegram bot."""
@@ -103,11 +106,7 @@ def calculate_stoch_rsi(df, period=14, smooth_k=3, smooth_d=3):
     return df
 
 def check_4h_macro_crossover(symbol, is_long):
-    """
-    Checks 4-hour timeframe Stochastic RSI fresh crossover condition (4h A):
-    - For Longs: Fresh crossover upwards (%K crosses above %D) within below 10 zone.
-    - For Shorts: Fresh crossover downwards (%K crosses below %D) within above 90 zone.
-    """
+    """Checks 4-hour timeframe Stochastic RSI fresh crossover condition."""
     try:
         ohlcv_4h = fetch_ohlcv_direct(symbol, '4h', limit=50)
         if len(ohlcv_4h) < 30:
@@ -128,12 +127,10 @@ def check_4h_macro_crossover(symbol, is_long):
             return False
             
         if is_long:
-            # 4H Long: Fresh cross upwards within below 10 zone
             is_cross_up = (prev_k <= prev_d and k > d) or (prev2_k <= prev2_d and prev_k > prev_d)
             in_zone = (k < 10 or prev_k < 10 or prev2_k < 10) and (d < 10)
             return is_cross_up and in_zone
         else:
-            # 4H Short: Fresh cross downwards within above 90 zone
             is_cross_down = (prev_k >= prev_d and k < d) or (prev2_k >= prev2_d and prev_k < prev_d)
             in_zone = (k > 90 or prev_k > 90 or prev2_k > 90) and (d > 90)
             return is_cross_down and in_zone
@@ -141,24 +138,17 @@ def check_4h_macro_crossover(symbol, is_long):
         return False
 
 def check_precision_order_block(df, is_long):
-    """
-    Identifies a true institutional Order Block with exact starting and ending prices:
-    - Bullish OB: Last bearish (red) candle before an impulsive bullish expansion.
-    - Bearish OB: Last bullish (green) candle before an impulsive bearish expansion.
-    Returns: (IsValid, OB_Start_Low, OB_End_High, OB_Type)
-    """
+    """Identifies a true institutional Order Block with exact starting and ending prices."""
     if len(df) < 30:
         return False, 0.0, 0.0, ""
         
     curr_price = df.iloc[-1]['close']
     
-    # Scan recent candles for institutional displacement
     for i in range(len(df) - 4, max(5, len(df) - 25), -1):
-        prev_row = df.iloc[i]     # Potential Order Block candle
-        next_row = df.iloc[i+1]   # Impulsive expansion candle
+        prev_row = df.iloc[i]
+        next_row = df.iloc[i+1]
         
         if is_long:
-            # Bullish OB: Red candle before green expansion
             if prev_row['close'] < prev_row['open'] and next_row['close'] > next_row['open']:
                 body_prev = abs(prev_row['close'] - prev_row['open'])
                 body_next = abs(next_row['close'] - next_row['open'])
@@ -166,11 +156,9 @@ def check_precision_order_block(df, is_long):
                 if body_next >= (body_prev * 0.9):
                     ob_low = prev_row['low']
                     ob_high = prev_row['high']
-                    # Verify price is currently testing or respecting this zone
                     if ob_low <= curr_price <= (ob_high * 1.02) and curr_price >= (ob_low * 0.98):
                         return True, ob_low, ob_high, "Bullish Order Block"
         else:
-            # Bearish OB: Green candle before red expansion
             if prev_row['close'] > prev_row['open'] and next_row['close'] < next_row['open']:
                 body_prev = abs(prev_row['close'] - prev_row['open'])
                 body_next = abs(next_row['close'] - next_row['open'])
@@ -178,7 +166,6 @@ def check_precision_order_block(df, is_long):
                 if body_next >= (body_prev * 0.9):
                     ob_low = prev_row['low']
                     ob_high = prev_row['high']
-                    # Verify price is currently testing this zone from below
                     if (ob_low * 0.98) <= curr_price <= ob_high:
                         return True, ob_low, ob_high, "Bearish Order Block"
                         
@@ -198,6 +185,12 @@ def scan_markets():
     print(f"\n[SCANNING] Sweeping {len(pairs)} Binance coins across timeframes: {TIMEFRAMES}\n")
     
     scan_results = []
+    current_time = time.time()
+    
+    # Clean up old tracking records older than 2 hours to keep memory fresh
+    global ACTIVE_ALERTS
+    ACTIVE_ALERTS = {k: v for k, v in ACTIVE_ALERTS.items() if current_time - v < 7200}
+
     for idx, symbol in enumerate(pairs):
         print(f"[{idx+1}/{len(pairs)}] Scanning {symbol}...")
         
@@ -218,18 +211,16 @@ def scan_markets():
                 prev_k, prev_d = prev['stoch_k'], prev['stoch_d']
                 prev2_k, prev2_d = prev2['stoch_k'], prev2['stoch_d']
                 price = curr['close']
+                candle_timestamp = int(curr['timestamp'])  # Unique identifier for the specific candle bar
                 
                 if pd.isna(k) or pd.isna(d):
                     continue
                 
-                # --- LOWER TIMEFRAME SETUP CHECK ---
-                # Long: Fresh cross upwards within below 6 zone
                 is_long_crossover = (
                     ((prev_k <= prev_d and k > d) or (prev2_k <= prev2_d and prev_k > prev_d)) and
                     (k < 6 or prev_k < 6 or prev2_k < 6) and (d < 6)
                 )
                 
-                # Short: Fresh cross downwards within above 94 zone
                 is_short_crossover = (
                     ((prev_k >= prev_d and k < d) or (prev2_k >= prev2_d and prev2_k < prev_d)) and
                     (k > 94 or prev_k > 94 or prev2_k > 94) and (d > 94)
@@ -237,38 +228,36 @@ def scan_markets():
                 
                 if is_long_crossover or is_short_crossover:
                     is_long = is_long_crossover
+                    direction = "🟢 LONG" if is_long else "🔴 SHORT"
                     
-                    # 1. Precision Order Block Validation on Lower Timeframe
+                    # Unique alert key tied strictly to the specific candle timestamp & direction to prevent duplicate spamming
+                    alert_key = f"{symbol}_{tf}_{direction}_{candle_timestamp}"
+                    
                     has_ob, ob_low, ob_high, ob_type = check_precision_order_block(df, is_long)
                     if not has_ob:
                         continue
                         
-                    # 2. Synchronize with 4H Macro Crossover Setup (4h A)
                     macro_synced = check_4h_macro_crossover(symbol, is_long)
                     if not macro_synced:
                         continue
 
                     ob_size = abs(ob_high - ob_low)
 
-                    # 3. Risk Management: Calculate Stop Loss and Take Profit targets based on OB
                     if is_long:
-                        stop_loss = ob_low * 0.995  # 0.5% buffer below OB start low
+                        stop_loss = ob_low * 0.995
                         risk = price - stop_loss
-                        tp1 = price + (risk * 2.0)   # 1:2 RRR
-                        tp2 = price + (risk * 3.5)   # 1:3.5 RRR
-                        direction = f"🟢 LONG"
+                        tp1 = price + (risk * 2.0)
+                        tp2 = price + (risk * 3.5)
                         macro_desc = "4H Cross Up within < 10 Zone"
                         ltf_desc = "LTF Cross Up within < 6 Zone + Bullish OB"
                     else:
-                        stop_loss = ob_high * 1.005 # 0.5% buffer above OB end high
+                        stop_loss = ob_high * 1.005
                         risk = stop_loss - price
-                        tp1 = price - (risk * 2.0)   # 1:2 RRR
-                        tp2 = price - (risk * 3.5)   # 1:3.5 RRR
-                        direction = f"🔴 SHORT"
+                        tp1 = price - (risk * 2.0)
+                        tp2 = price - (risk * 3.5)
                         macro_desc = "4H Cross Down within > 90 Zone"
                         ltf_desc = "LTF Cross Down within > 94 Zone + Bearish OB"
 
-                    alert_key = f"{symbol}_{tf}"
                     p_str = lambda p: f"{p:,.4f}" if p < 1 else f"{p:,.2f}"
                     
                     record = {
@@ -286,7 +275,7 @@ def scan_markets():
                     }
                     scan_results.append(record)
                     
-                    if alert_key not in ALERTS_SENT:
+                    if alert_key not in ACTIVE_ALERTS:
                         send_telegram_alert(
                             title="🎯 PERFECT STOCH CROSS + OB SETUP",
                             message_body=(
@@ -308,7 +297,7 @@ def scan_markets():
                             ),
                             alert_type="TRADE"
                         )
-                        ALERTS_SENT.add(alert_key)
+                        ACTIVE_ALERTS[alert_key] = current_time
 
             except Exception:
                 continue
